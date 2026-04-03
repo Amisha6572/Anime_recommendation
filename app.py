@@ -1,10 +1,12 @@
 # ============================================================
 # ANIME RECOMMENDATION SYSTEM — RESUME READY
 # ============================================================
-import pandas as pd
+import os
+import warnings
 import numpy as np
-import streamlit as st
+import pandas as pd
 import requests
+import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -17,8 +19,11 @@ from sklearn.metrics import silhouette_score, davies_bouldin_score
 from scipy.stats import skew
 from fuzzywuzzy import process
 import shap
-import warnings
+
 warnings.filterwarnings("ignore")
+
+# Resolve paths relative to this file — works on Streamlit Cloud
+_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ============================================================
 # PAGE CONFIG — must be first Streamlit call
@@ -66,20 +71,46 @@ hr { border-color:#333 !important; }
 """, unsafe_allow_html=True)
 
 # ============================================================
-# DATA LOADING
+# DATA LOADING — Google Drive fallback for Streamlit Cloud
 # ============================================================
+ANIME_GDRIVE_ID  = "1g4guyN03IjkjFPwcH_HsqiKVD9yVOQ-o"
+RATING_GDRIVE_ID = "1SkXzRsDvUesE3ZoUH3c7hitfyKPCAI9T"
+
+def _load_from_gdrive(file_id: str, dest: str, **read_kwargs) -> pd.DataFrame:
+    """Download from Google Drive using gdown (handles large-file confirm tokens)."""
+    import gdown
+    url = f"https://drive.google.com/uc?id={file_id}"
+    gdown.download(url, dest, quiet=False, fuzzy=True)
+    return pd.read_csv(dest, **read_kwargs)
+
 @st.cache_data(show_spinner=False)
 def load_data():
-    anime = pd.read_csv("anime.csv")
+    """
+    Load anime.csv and rating.csv.
+    Priority: local file → Google Drive via gdown.
+    rating.csv capped at 500k rows to avoid OOM on Streamlit Cloud.
+    """
+    # ── anime.csv ──────────────────────────────────────────
+    local_anime = os.path.join(_DIR, "anime.csv")
+    if os.path.exists(local_anime):
+        anime = pd.read_csv(local_anime)
+    else:
+        anime = _load_from_gdrive(ANIME_GDRIVE_ID, local_anime)
+
+    # ── rating.csv ─────────────────────────────────────────
+    local_rating = os.path.join(_DIR, "rating.csv")
+    rating_kwargs = {
+        "nrows": 500_000,
+        "dtype": {"user_id": "int32", "anime_id": "int32", "rating": "int8"}
+    }
     try:
-        # Cap at 500k rows to avoid OOM on Streamlit Cloud
-        rating = pd.read_csv(
-            "rating.csv",
-            nrows=500_000,
-            dtype={"user_id": "int32", "anime_id": "int32", "rating": "int8"}
-        )
+        if os.path.exists(local_rating):
+            rating = pd.read_csv(local_rating, **rating_kwargs)
+        else:
+            rating = _load_from_gdrive(RATING_GDRIVE_ID, local_rating, **rating_kwargs)
     except Exception:
         rating = None
+
     return anime, rating
 
 # ============================================================
@@ -160,10 +191,16 @@ def build_cluster_features(_df, _tfidf_matrix):
 def find_optimal_k(_X_pca):
     sil_scores, inertias, ks = [], [], list(range(2, 13))
     for k in ks:
-        km = KMeans(n_clusters=k, random_state=42, n_init=15, max_iter=500)
-        labels = km.fit_predict(_X_pca)
-        sil_scores.append(silhouette_score(_X_pca, labels))
-        inertias.append(km.inertia_)
+        try:
+            km     = KMeans(n_clusters=k, random_state=42, n_init=15, max_iter=500)
+            labels = km.fit_predict(_X_pca)
+            n_unique = len(set(labels))
+            sil = silhouette_score(_X_pca, labels) if n_unique > 1 else 0.0
+            sil_scores.append(sil)
+            inertias.append(km.inertia_)
+        except Exception:
+            sil_scores.append(0.0)
+            inertias.append(float("inf"))
     best_k = ks[int(np.argmax(sil_scores))]
     return ks, sil_scores, inertias, best_k
 
@@ -536,103 +573,109 @@ def main():
             manual_k = st.slider("Manual k", 2, 15, 6)
 
         if st.button("🤖 Run Clustering"):
-            with st.spinner("Building features & clustering..."):
-                X_pca, X_2d, top_genres, n_comp, cumvar = build_cluster_features(df, tfidf_matrix)
-                pdf = df[["name", "type", "rating", "genre"]].copy().reset_index(drop=True)
-                pdf["PC1"] = X_2d[:, 0]; pdf["PC2"] = X_2d[:, 1]
+            try:
+                with st.spinner("Building features & clustering..."):
+                    X_pca, X_2d, top_genres, n_comp, cumvar = build_cluster_features(df, tfidf_matrix)
+                    pdf = df[["name", "type", "rating", "genre"]].copy().reset_index(drop=True)
+                    pdf["PC1"] = X_2d[:, 0]; pdf["PC2"] = X_2d[:, 1]
 
-            st.markdown(f"""
-            <div style='background:#1f1f1f;border-radius:8px;padding:10px 14px;margin-bottom:14px;border:1px solid #333'>
-                <span style='color:#b3b3b3;font-size:0.83rem'>
-                📐 <b style='color:#ffd700'>{n_comp} PCA components</b> (90% variance) from
-                {len(top_genres)} genre + type + 3 numeric features
-                </span>
-            </div>""", unsafe_allow_html=True)
+                st.markdown(f"""
+                <div style='background:#1f1f1f;border-radius:8px;padding:10px 14px;margin-bottom:14px;border:1px solid #333'>
+                    <span style='color:#b3b3b3;font-size:0.83rem'>
+                    📐 <b style='color:#ffd700'>{n_comp} PCA components</b> (90% variance) from
+                    {len(top_genres)} genre + type + 3 numeric features
+                    </span>
+                </div>""", unsafe_allow_html=True)
 
-            if algo in ["KMeans Auto-k", "KMeans Manual k"]:
-                with st.spinner("Sweeping k=2…12 for best silhouette..."):
-                    ks, sil_scores, inertias, best_k = find_optimal_k(X_pca)
-                chosen_k = best_k if algo == "KMeans Auto-k" else manual_k
+                if algo in ["KMeans Auto-k", "KMeans Manual k"]:
+                    with st.spinner("Sweeping k=2…12 for best silhouette..."):
+                        ks, sil_scores, inertias, best_k = find_optimal_k(X_pca)
+                    chosen_k = best_k if algo == "KMeans Auto-k" else manual_k
 
-                # Silhouette + elbow chart
-                st.markdown('<div class="section-header">📈 Silhouette vs k</div>', unsafe_allow_html=True)
-                fig_sw = make_subplots(rows=1, cols=2,
-                                       subplot_titles=["Silhouette (↑ better)", "Elbow — Inertia (↓ better)"])
-                fig_sw.add_trace(go.Scatter(
-                    x=ks, y=sil_scores, mode="lines+markers",
-                    line=dict(color="#46d369", width=2),
-                    marker=dict(color=["#e50914" if k == best_k else "#46d369" for k in ks], size=10)
-                ), row=1, col=1)
-                fig_sw.add_trace(go.Scatter(
-                    x=ks, y=inertias, mode="lines+markers",
-                    line=dict(color="#e50914", width=2),
-                    marker=dict(color="#ffd700", size=8)
-                ), row=1, col=2)
-                fig_sw.add_vline(x=best_k, line_dash="dash", line_color="#ffd700",
-                                 annotation_text=f"Best k={best_k}", row=1, col=1)
-                fig_sw.update_layout(template="plotly_dark", paper_bgcolor="#141414",
-                                     plot_bgcolor="#1f1f1f", font_color="#e5e5e5",
-                                     height=360, showlegend=False)
-                st.plotly_chart(fig_sw, use_container_width=True)
+                    # Silhouette + elbow chart
+                    st.markdown('<div class="section-header">📈 Silhouette vs k</div>', unsafe_allow_html=True)
+                    fig_sw = make_subplots(rows=1, cols=2,
+                                           subplot_titles=["Silhouette (↑ better)", "Elbow — Inertia (↓ better)"])
+                    fig_sw.add_trace(go.Scatter(
+                        x=ks, y=sil_scores, mode="lines+markers",
+                        line=dict(color="#46d369", width=2),
+                        marker=dict(color=["#e50914" if k == best_k else "#46d369" for k in ks], size=10)
+                    ), row=1, col=1)
+                    fig_sw.add_trace(go.Scatter(
+                        x=ks, y=inertias, mode="lines+markers",
+                        line=dict(color="#e50914", width=2),
+                        marker=dict(color="#ffd700", size=8)
+                    ), row=1, col=2)
+                    fig_sw.add_vline(x=best_k, line_dash="dash", line_color="#ffd700",
+                                     annotation_text=f"Best k={best_k}", row=1, col=1)
+                    fig_sw.update_layout(template="plotly_dark", paper_bgcolor="#141414",
+                                         plot_bgcolor="#1f1f1f", font_color="#e5e5e5",
+                                         height=360, showlegend=False)
+                    st.plotly_chart(fig_sw, use_container_width=True)
 
-                km     = KMeans(n_clusters=chosen_k, random_state=42, n_init=15, max_iter=500)
-                labels = km.fit_predict(X_pca)
-                sil    = silhouette_score(X_pca, labels)
-                dbs    = davies_bouldin_score(X_pca, labels)
-                pdf["Cluster"] = labels.astype(str)
+                    km     = KMeans(n_clusters=chosen_k, random_state=42, n_init=15, max_iter=500)
+                    labels = km.fit_predict(X_pca)
+                    n_unique = len(set(labels))
+                    sil  = silhouette_score(X_pca, labels) if n_unique > 1 else 0.0
+                    dbs  = davies_bouldin_score(X_pca, labels) if n_unique > 1 else 0.0
+                    pdf["Cluster"] = labels.astype(str)
 
-                s1, s2, s3 = st.columns(3)
-                s1.markdown(f'<div class="metric-card"><div class="metric-value" style="color:#46d369">{sil:.3f}</div><div class="metric-label">Silhouette (↑ better)</div></div>', unsafe_allow_html=True)
-                s2.markdown(f'<div class="metric-card"><div class="metric-value" style="color:#ffd700">{dbs:.3f}</div><div class="metric-label">Davies-Bouldin (↓ better)</div></div>', unsafe_allow_html=True)
-                s3.markdown(f'<div class="metric-card"><div class="metric-value">{chosen_k}</div><div class="metric-label">Clusters</div></div>', unsafe_allow_html=True)
-                title = f"KMeans k={chosen_k} · Silhouette={sil:.3f} · DB={dbs:.3f}"
+                    s1, s2, s3 = st.columns(3)
+                    s1.markdown(f'<div class="metric-card"><div class="metric-value" style="color:#46d369">{sil:.3f}</div><div class="metric-label">Silhouette (↑ better)</div></div>', unsafe_allow_html=True)
+                    s2.markdown(f'<div class="metric-card"><div class="metric-value" style="color:#ffd700">{dbs:.3f}</div><div class="metric-label">Davies-Bouldin (↓ better)</div></div>', unsafe_allow_html=True)
+                    s3.markdown(f'<div class="metric-card"><div class="metric-value">{chosen_k}</div><div class="metric-label">Clusters</div></div>', unsafe_allow_html=True)
+                    title = f"KMeans k={chosen_k} · Silhouette={sil:.3f} · DB={dbs:.3f}"
 
-            else:  # DBSCAN
-                db     = DBSCAN(eps=0.8, min_samples=3).fit(X_pca)
-                labels = db.labels_
-                n_cl   = len(set(labels)) - (1 if -1 in labels else 0)
-                noise  = list(labels).count(-1)
-                pdf["Cluster"] = labels.astype(str)
-                sil    = silhouette_score(X_pca, labels) if n_cl > 1 else 0.0
-                title  = f"DBSCAN · {n_cl} clusters · {noise} noise · Silhouette={sil:.3f}"
+                else:  # DBSCAN
+                    db     = DBSCAN(eps=0.8, min_samples=3).fit(X_pca)
+                    labels = db.labels_
+                    n_cl   = len(set(labels)) - (1 if -1 in labels else 0)
+                    noise  = list(labels).count(-1)
+                    pdf["Cluster"] = labels.astype(str)
+                    sil    = silhouette_score(X_pca, labels) if n_cl > 1 else 0.0
+                    title  = f"DBSCAN · {n_cl} clusters · {noise} noise · Silhouette={sil:.3f}"
 
-            fig_cl = px.scatter(pdf, x="PC1", y="PC2", color="Cluster",
-                                hover_data=["name", "rating", "type", "genre"],
-                                title=title, template="plotly_dark",
-                                color_discrete_sequence=px.colors.qualitative.Bold)
-            fig_cl.update_traces(marker=dict(size=7, opacity=0.8))
-            fig_cl.update_layout(paper_bgcolor="#141414", plot_bgcolor="#1f1f1f",
-                                 font_color="#e5e5e5", height=560)
-            st.plotly_chart(fig_cl, use_container_width=True)
+                fig_cl = px.scatter(pdf, x="PC1", y="PC2", color="Cluster",
+                                    hover_data=["name", "rating", "type", "genre"],
+                                    title=title, template="plotly_dark",
+                                    color_discrete_sequence=px.colors.qualitative.Bold)
+                fig_cl.update_traces(marker=dict(size=7, opacity=0.8))
+                fig_cl.update_layout(paper_bgcolor="#141414", plot_bgcolor="#1f1f1f",
+                                     font_color="#e5e5e5", height=560)
+                st.plotly_chart(fig_cl, use_container_width=True)
 
-            if algo != "DBSCAN":
-                st.markdown('<div class="section-header">🎭 Cluster Composition</div>', unsafe_allow_html=True)
-                pdf["Cluster_int"] = labels
-                pdf["genre_col"]   = df["genre"].values
-                cdata = []
-                for c in sorted(pdf["Cluster_int"].unique()):
-                    sub = pdf[pdf["Cluster_int"] == c]
-                    top_g = (sub["genre_col"].str.split(",").explode().str.strip()
-                             .value_counts().head(3).index.tolist())
-                    top3  = sub.nlargest(3, "rating")[["name", "rating"]].values
-                    names_str = " | ".join([f"{r[0]} ({r[1]:.1f})" for r in top3])
-                    genre_str = ", ".join(top_g)
-                    cdata.append({"cluster": c, "size": len(sub)})
-                    st.markdown(f"""
-                    <div style='background:#1f1f1f;border-radius:8px;padding:10px 14px;margin-bottom:7px;border-left:3px solid #e50914'>
-                        <span style='color:#e50914;font-weight:700'>Cluster {c}</span>
-                        <span style='color:#b3b3b3;font-size:0.8rem;margin-left:8px'>{len(sub)} anime</span>
-                        <div style='color:#ffd700;font-size:0.78rem;margin-top:3px'>🎭 {genre_str}</div>
-                        <div style='color:#e5e5e5;font-size:0.76rem;margin-top:2px'>⭐ {names_str}</div>
-                    </div>""", unsafe_allow_html=True)
+                if algo != "DBSCAN":
+                    st.markdown('<div class="section-header">🎭 Cluster Composition</div>', unsafe_allow_html=True)
+                    pdf["Cluster_int"] = labels
+                    pdf["genre_col"]   = df["genre"].values
+                    cdata = []
+                    for c in sorted(pdf["Cluster_int"].unique()):
+                        sub   = pdf[pdf["Cluster_int"] == c]
+                        top_g = (sub["genre_col"].str.split(",").explode().str.strip()
+                                 .value_counts().head(3).index.tolist())
+                        top3  = sub.nlargest(3, "rating")[["name", "rating"]].values
+                        names_str = " | ".join([f"{r[0]} ({r[1]:.1f})" for r in top3])
+                        genre_str = ", ".join(top_g)
+                        cdata.append({"cluster": c, "size": len(sub)})
+                        st.markdown(f"""
+                        <div style='background:#1f1f1f;border-radius:8px;padding:10px 14px;margin-bottom:7px;border-left:3px solid #e50914'>
+                            <span style='color:#e50914;font-weight:700'>Cluster {c}</span>
+                            <span style='color:#b3b3b3;font-size:0.8rem;margin-left:8px'>{len(sub)} anime</span>
+                            <div style='color:#ffd700;font-size:0.78rem;margin-top:3px'>🎭 {genre_str}</div>
+                            <div style='color:#e5e5e5;font-size:0.76rem;margin-top:2px'>⭐ {names_str}</div>
+                        </div>""", unsafe_allow_html=True)
 
-                cdf    = pd.DataFrame(cdata)
-                fig_cs = px.bar(cdf, x="cluster", y="size", color="size",
-                                color_continuous_scale="Reds", template="plotly_dark",
-                                title="Anime Count per Cluster")
-                fig_cs.update_layout(paper_bgcolor="#141414", plot_bgcolor="#1f1f1f",
-                                     font_color="#e5e5e5", height=320)
-                st.plotly_chart(fig_cs, use_container_width=True)
+                    cdf    = pd.DataFrame(cdata)
+                    fig_cs = px.bar(cdf, x="cluster", y="size", color="size",
+                                    color_continuous_scale="Reds", template="plotly_dark",
+                                    title="Anime Count per Cluster")
+                    fig_cs.update_layout(paper_bgcolor="#141414", plot_bgcolor="#1f1f1f",
+                                         font_color="#e5e5e5", height=320)
+                    st.plotly_chart(fig_cs, use_container_width=True)
+
+            except Exception as e:
+                st.error(f"Clustering failed: {e}")
+                st.info("Try reducing the number of clusters or switching to KMeans Auto-k.")
         else:
             st.info("👆 Configure and click 'Run Clustering' to start.")
 
