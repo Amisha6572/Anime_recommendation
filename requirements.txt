@@ -8,3 +8,4 @@ fuzzywuzzy>=0.18.0
 python-Levenshtein>=0.21.0
 shap>=0.44.0
 scipy>=1.11.0
+gdown
